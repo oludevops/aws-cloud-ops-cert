@@ -1,0 +1,32 @@
+name: Terraform CI
+
+on:
+  push:
+    paths:
+      - "t3-micro/**"
+  pull_request:
+    paths:
+      - "t3-micro/**"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: t3-micro
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Check formatting
+        run: terraform fmt -check -diff
+
+      - name: Initialise (no backend, no AWS access needed)
+        run: terraform init -backend=false
+
+      - name: Validate configuration
+        run: terraform validate
