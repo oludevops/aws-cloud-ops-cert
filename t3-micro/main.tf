@@ -50,6 +50,12 @@ variable "private_key_path" {
   default     = "~/.ssh/my_first_instance.pem"
 }
 
+variable "alert_email" {
+  description = "Email for alarm notifications (leave empty to skip)"
+  type        = string
+  default     = ""
+}
+
 variable "vpc_cidr" {
   description = "IP range for the new VPC"
   type        = string
@@ -186,6 +192,70 @@ resource "aws_security_group" "ssh" {
   }
 }
 
+# ---------------------------- IAM for the CloudWatch agent -------------------
+
+# Role the EC2 instance assumes, so the agent can publish metrics without keys
+resource "aws_iam_role" "ec2" {
+  name = "${var.instance_name}-ec2-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+# Lets the CloudWatch agent put metrics and logs
+resource "aws_iam_role_policy_attachment" "cw_agent" {
+  role       = aws_iam_role.ec2.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+
+# Lets you reach the instance with SSM Session Manager - your way back in
+# if you stop sshd during the test and lose your SSH session
+resource "aws_iam_role_policy_attachment" "ssm" {
+  role       = aws_iam_role.ec2.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "ec2" {
+  name = "${var.instance_name}-ec2-profile"
+  role = aws_iam_role.ec2.name
+}
+
+# ---------------------------- CloudWatch agent config ------------------------
+
+locals {
+  # procstat watches the sshd LISTENER process only. Matching by command line
+  # ("/usr/sbin/sshd -D") avoids also counting the per-login sshd processes,
+  # so pid_count drops to 0 when the sshd service is stopped, even while you
+  # are still logged in.
+  sshd_pattern = "/usr/sbin/sshd -D"
+
+  cw_agent_config = jsonencode({
+    agent = {
+      metrics_collection_interval = 60
+      omit_hostname               = true
+      run_as_user                 = "root"
+    }
+    metrics = {
+      namespace = "CWAgent"
+      append_dimensions = {
+        InstanceId = "$${aws:InstanceId}"
+      }
+      metrics_collected = {
+        procstat = [{
+          pattern     = local.sshd_pattern
+          measurement = ["pid_count", "cpu_usage", "memory_rss"]
+        }]
+      }
+    }
+  })
+}
+
 resource "aws_instance" "this" {
   ami                         = data.aws_ssm_parameter.al2023.value
   instance_type               = "t3.micro"
@@ -193,6 +263,23 @@ resource "aws_instance" "this" {
   key_name                    = aws_key_pair.this.key_name
   vpc_security_group_ids      = [aws_security_group.ssh.id]
   associate_public_ip_address = true
+  iam_instance_profile        = aws_iam_instance_profile.ec2.name
+
+  # First-boot script: install the CloudWatch agent, write its config
+  # (procstat for sshd), and start it.
+  user_data_replace_on_change = true
+  user_data                   = <<-EOF
+    #!/bin/bash
+    set -euxo pipefail
+    dnf install -y amazon-cloudwatch-agent
+    mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+    cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CWCFG'
+    ${local.cw_agent_config}
+    CWCFG
+    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+      -a fetch-config -m ec2 -s \
+      -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+  EOF
 
   # Hibernation: saves RAM to the (encrypted) root volume on stop.
   # Can only be set at launch - changing it replaces the instance.
@@ -220,6 +307,45 @@ resource "aws_instance" "this" {
   depends_on = [aws_route_table_association.public]
 }
 
+# ---------------------------- Alerting ---------------------------------------
+
+resource "aws_sns_topic" "alerts" {
+  name = "${var.instance_name}-alerts"
+}
+
+# Email subscription only if you set alert_email
+resource "aws_sns_topic_subscription" "email" {
+  count     = var.alert_email == "" ? 0 : 1
+  topic_arn = aws_sns_topic.alerts.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
+# ALARM when the sshd listener process is not running
+resource "aws_cloudwatch_metric_alarm" "sshd_down" {
+  alarm_name          = "${var.instance_name}-sshd-not-running"
+  alarm_description   = "sshd listener process count fell below 1 (procstat pid_count)"
+  namespace           = "CWAgent"
+  metric_name         = "procstat_lookup_pid_count"
+  statistic           = "Minimum"
+  period              = 60
+  evaluation_periods  = 2
+  comparison_operator = "LessThanThreshold"
+  threshold           = 1
+
+  # No data at all (agent stopped, instance down) is treated as a problem too
+  treat_missing_data = "breaching"
+
+  dimensions = {
+    InstanceId = aws_instance.this.id
+    pattern    = local.sshd_pattern
+    pid_finder = "native"
+  }
+
+  alarm_actions = [aws_sns_topic.alerts.arn]
+  ok_actions    = [aws_sns_topic.alerts.arn]
+}
+
 # ---------------------------- Outputs ----------------------------------------
 
 output "vpc_id" {
@@ -240,6 +366,10 @@ output "key_pair_name" {
 
 output "private_key_file" {
   value = local_sensitive_file.private_key.filename
+}
+
+output "sshd_alarm_name" {
+  value = aws_cloudwatch_metric_alarm.sshd_down.alarm_name
 }
 
 output "ssh_command" {
