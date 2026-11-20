@@ -1,0 +1,37 @@
+# Terraform working directories (provider binaries, modules)
+**/.terraform/*
+
+# State files - contain resource IDs and the generated SSH private key
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Variable files - may contain personal values (emails, IPs, secrets)
+*.tfvars
+*.tfvars.json
+
+# Local override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Saved plan files
+*.tfplan
+tfplan
+
+# SSH keys
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+
+# Editor / OS clutter
+.vscode/
+.idea/
+*.swp
+.DS_Store
